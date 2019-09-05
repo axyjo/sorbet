@@ -531,14 +531,61 @@ void TypeDefAssertion::check(const UnorderedMap<string, shared_ptr<core::File>> 
                              LSPWrapper &lspWrapper, int &nextId, string_view uriPrefix, const Location &queryLoc) {
     const int line = queryLoc.range->start->line;
     // Can only query with one character, so just use the first one.
-    // const int character = queryLoc.range->start->character;
-    // auto locSourceLine = getLine(sourceFileContents, uriPrefix, queryLoc);
-    // auto defSourceLine = getLine(sourceFileContents, uriPrefix, *getLocation(uriPrefix));
+    const int character = queryLoc.range->start->character;
+    auto locSourceLine = getLine(sourceFileContents, uriPrefix, queryLoc);
+    auto defSourceLine = getLine(sourceFileContents, uriPrefix, *getLocation(uriPrefix));
     string locFilename = uriToFilePath(uriPrefix, queryLoc.uri);
-    // string defUri = filePathToUri(uriPrefix, filename);
+    string defUri = filePathToUri(uriPrefix, filename);
 
-    ADD_FAILURE_AT(locFilename.c_str(), line) << fmt::format(
-        "TODO(jez) Implement the actual checks for `type` and `type-def` once Go To Type Definition is implemented");
+    const int id = nextId++;
+    auto request = make_unique<LSPMessage>(make_unique<RequestMessage>(
+        "2.0", id, LSPMethod::TextDocumentTypeDefinition,
+        make_unique<TextDocumentPositionParams>(make_unique<TextDocumentIdentifier>(string(queryLoc.uri)),
+                                                make_unique<Position>(line, character))));
+    auto responses = lspWrapper.getLSPResponsesFor(*request);
+    ASSERT_EQ(1, responses.size());
+
+    ASSERT_NO_FATAL_FAILURE(assertResponseMessage(id, *responses.at(0)));
+    auto &respMsg = responses.at(0)->asResponse();
+    ASSERT_TRUE(respMsg.result.has_value());
+    ASSERT_FALSE(respMsg.error.has_value());
+
+    auto &locations = extractLocations(respMsg);
+    if (locations.empty()) {
+        ADD_FAILURE_AT(locFilename.c_str(), line + 1) << fmt::format(
+            "Sorbet did not find a definition for location that references symbol `{}`.\nExpected definition "
+            "of:\n{}\nTo be:\n{}",
+            symbol, prettyPrintRangeComment(locSourceLine, *makeRange(line, character, character + 1), ""),
+            prettyPrintRangeComment(defSourceLine, *range, ""));
+        return;
+    } else if (locations.size() > 1) {
+        ADD_FAILURE_AT(locFilename.c_str(), line + 1) << fmt::format(
+            "Sorbet unexpectedly returned multiple locations for definition of symbol `{}`.\nFor "
+            "location:\n{}\nSorbet returned the following definition locations:\n{}",
+            symbol, prettyPrintRangeComment(locSourceLine, *makeRange(line, character, character + 1), ""),
+            fmt::map_join(locations, "\n", [&sourceFileContents, &uriPrefix](const auto &arg) -> string {
+                return prettyPrintRangeComment(getLine(sourceFileContents, uriPrefix, *arg), *arg->range, "");
+            }));
+        return;
+    }
+
+    auto &location = locations.at(0);
+    // Note: Sorbet will point to the *statement* that defines the symbol, not just the symbol.
+    // For example, it'll point to "class Foo" instead of just "Foo", or `5` in `a = 5` instead of `a`.
+    // Thus, we just check that it returns the same line.
+    if (location->uri != defUri || location->range->start->line != range->start->line) {
+        string foundLocationString = "null";
+        if (location != nullptr) {
+            foundLocationString =
+                prettyPrintRangeComment(getLine(sourceFileContents, uriPrefix, *location), *location->range, "");
+        }
+
+        ADD_FAILURE_AT(filename.c_str(), line + 1)
+            << fmt::format("Sorbet did not return the expected definition for location. Expected "
+                           "definition of:\n{}\nTo be:\n{}\nBut was:\n{}",
+                           prettyPrintRangeComment(locSourceLine, *makeRange(line, character, character + 1), ""),
+                           prettyPrintRangeComment(defSourceLine, *range, ""), foundLocationString);
+    }
 }
 
 string TypeDefAssertion::toString() const {
